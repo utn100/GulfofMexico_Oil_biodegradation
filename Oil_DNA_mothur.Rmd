@@ -1,0 +1,556 @@
+---
+title: "Oli_DNA_mothur"
+author: "Uyen Nguyen"
+date: "8/30/2017"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r loading libraries}
+library(phyloseq)
+library(ggplot2)
+library(vegan)
+library(dplyr)
+library(scales)
+library(grid)
+library(reshape)
+inslibrary(ape)
+library(lattice)
+library(permute)
+library(nlme)
+library(stringr)
+library(plyr)
+library(RColorBrewer) 
+library(colorRamps)
+source("~/Downloads/miseqR.R")
+theme_set(theme_bw())
+library(grid)
+library(gridExtra)
+library(cowplot)
+
+```
+
+##Importing and touching up data
+
+```{r Importing data}
+#Import mothur shared and tax file
+sharedfile = "Oil_DNA_0.03.shared"
+taxfile = "Oil_DNA_0_03.taxonomy"
+#Import map file (including site,P,T,WD,TOC,Carb info)
+mapfile = "Oil_DNA_map.csv"
+map <- read.csv(mapfile)
+map <- sample_data(map)
+#Make composite file
+mothur_data <- import_mothur(mothur_shared_file = sharedfile,
+  mothur_constaxonomy_file = taxfile)
+rownames(map) <- map$Group
+moth_merge <- merge_phyloseq(mothur_data, map)
+#Label taxonomic ranks
+colnames(tax_table(moth_merge))
+colnames(tax_table(moth_merge)) <- c("Kingdom", "Phylum","Class","Order", "Family", "Genus")
+```
+
+
+##Summarize sample read counts
+```{r}
+# Make a data frame with a column for the read counts of each sample
+sample_sum_df <- data.frame(sum = sample_sums(moth_merge))
+
+tiff('Sequencing_depth.tiff',units="in",width = 4, height = 3, res=300)
+# Histogram of sample read counts
+ggplot(sample_sum_df, aes(x = sum)) + 
+  geom_histogram(color = "black", fill = "grey", binwidth = 500) +
+  ggtitle("Distribution of sample sequencing depth") + 
+  xlab("Read counts") +
+  theme(axis.title.y = element_blank(),axis.text=element_text(size=10), 
+        aixs.title = element_text(size=10))
+
+dev.off()
+
+```
+
+
+
+##Subsetting samples 
+```{r Subseting samples}
+
+#Get rid of blank samples
+moth_noblank <-  moth_merge %>%
+  subset_samples(!is.na(T)) #deleting data points that contains NA in the variables (blank samples in this case)
+
+#Subsetting samples based on taxa
+moth_bac <- moth_noblank %>% subset_taxa (Kingdom == "Bacteria")
+moth_arc <- moth_noblank %>% subset_taxa (Kingdom == "Archaea")
+
+topN =20
+most_abundant_taxa = sort(taxa_sums(moth_bac), TRUE)[1:topN]
+moth_bac_20 = prune_taxa(names(most_abundant_taxa), moth_bac)
+
+
+
+#Get all of the samples (not include day 0 and original sediment)
+moth_sample <- moth_noblank %>% 
+  subset_samples(Type%in%c("sample","dummy","control"))
+moth_reactor <- moth_noblank %>% 
+  subset_samples(Type=="sample")
+#Get the orig sediment and day 0 sediment
+moth_nosample <- moth_noblank %>% 
+  subset_samples(Type%in%c("orig","day0"))
+#Get day 0 and day 18 samples
+moth_noorig <- moth_noblank %>% 
+  subset_samples(Type%in%c("day0","sample","dummy"))
+#Get day 18 and orig samples
+moth_noday0 <- moth_noblank %>% 
+  subset_samples(Type%in%c("orig","sample"))
+moth_day0 <- moth_noblank %>% 
+  subset_samples(Type%in%c("day0"))
+
+moth_nodummy <-moth_noblank %>% 
+  subset_samples(Type%in%c("orig","sample","day0"))
+
+#Get the P-comparison data set
+
+moth_highP <- moth_sample %>% 
+  subset_samples(Site%in%c("DSH10","DSH08","PCB06"))
+min(sample_sums(moth_Pcomp))
+
+#Another way to extract time 0 samples 
+moth_other <-  moth_noblank %>%  subset_samples(Group%in%grep("orig",                                                      sample_names(moth_merge),inv=TRUE,value=TRUE))
+
+```
+
+##Ploting heatmap
+```{r heatmap}
+sample_phylum <- subset_taxa(moth_sample,Class=="Gammaproteobacteria")
+nosample_heat <-prune_taxa(names(sort(taxa_sums(moth_nosample),TRUE)[1:200]), moth_nosample)
+sample_heat <- prune_taxa(names(sort(taxa_sums(moth_sample),TRUE)[1:200]), moth_sample)
+day0_heat <- prune_taxa(names(sort(taxa_sums(moth_day0),TRUE)[1:100]), moth_day0)
+
+
+sample_order <- c('5a','5b','3a','3b','7a','7b','4a','4b',
+                  '8a','8b','6a','6b','10a','10b','15a','15b',
+                  '1a','1b','14a','14b','13a','13b','16a','16b')
+tiff('Heatmap_all.tiff',units="in",width = 8, height = 8, res=300)
+plot_heatmap(sample_heat,sample.label = 'WD',sample.order = sample_order,first.sample = '5a')
+dev.off()
+
+heatmap(otu_table(gpt))
+```
+
+##Extrating taxonomical level and stack plot
+```{r Extrating taxonomical level and stack plot}
+#Stacked plot for genus in each phylum
+Gamma <- moth_highP  %>%  subset_taxa (Class == "Gammaproteobacteria") 
+Proteobac <- moth_nodummy  %>%  subset_taxa (Phylum == "Proteobacteria") 
+Bacteroid <- moth_nodummy  %>%  subset_taxa (Phylum == "Bacteroidetes") 
+DSH <- moth_noblank %>% subset_samples(Site %in% c("DSH10","DSH08","PCB06","PCB09")) %>% subset_taxa(Phylum=="Proteobacteria")
+
+Genus <- moth_noblank%>%
+  tax_glom(taxrank = "Genus") %>%            # agglomerate at genus level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance
+  psmelt() %>%                               # Melt to long format
+  #filter(Abundance > 0.005) %>%               # Filter out low abundance taxa
+  arrange(Genus)                 # Sort data frame alphabetically by genus
+
+write.csv(Genus, file='oil_genus_all.csv')
+
+phylum_colors_1 <- c("#0e02f9","#dc01f9","#5E738F","#f73702","#D1A33D","#8A7C64", "#599861","#CBD588","#CD9BCD","#AD6F3B","#dadd06","#71757a","#673770","#D14285","yellow", "#652926","#C84248","#8569D5","#85b3fc","#a3c197","#505e46","#694b77","#fc9c02","#fcb4a9","#f698f9","#8e3966","#700f1f","#4c4c4b","#21301b")
+phylum_colors_2 <- c("#0e02f9", "#dc01f9","#f73702", "#508578", "#CD9BCD","#AD6F3B", "#673770","#D14285", "#652926", "#C84248","#8569D5","#71757a")
+
+plot1 <- ggplot(Genus %>% subset(Pressure_regime=="Low P"), aes(x = Sample,y= Abundance,  fill = Genus)) + 
+  #facet_grid(Pressure_regime~.)+
+  #coord_flip()+
+  geom_bar(stat = "identity", width = 0.8)+ #scale_color_brewer(palette = "Dark2")+
+  scale_fill_manual(values = phylum_colors_1) +
+  theme(axis.text.x=element_text(size=10))
+
+plot2 <- ggplot(Genus %>% subset(Pressure_regime=="High P"), aes(x = Sample,y= Abundance,  fill = Genus)) + 
+  #facet_grid(Pressure_regime~.)+
+  #coord_flip()+
+  geom_bar(stat = "identity",width = 0.8)+ #scale_color_brewer(palette = "Dark2")+
+  scale_fill_manual(values = phylum_colors_2) +
+  theme( axis.text.x = element_text(size=10))#,legend.position="none")
+  
+plot_grid(plot2, plot1, align = "h", ncol = 2, rel_widths = c(1/3, 2/3))
+tiff('Gamma_genus_stacked.tiff')
+dev.off()
+grid.arrange(plot2,plot1,ncol=2)
+ # scale_x_discrete(
+    #breaks = c("7/8", "8/4", "9/2", "10/6"),
+    #labels = Genus$Sample, #c("Jul", "Aug", "Sep", "Oct"), 
+    #drop = FALSE
+  #)
+
+#Stacked plot for all phyla
+Level <- moth_sample%>%
+  tax_glom(taxrank = "Genus") %>%            # agglomerate at genus level
+  transform_sample_counts(function(x) {x/sum(x)} ) %>% # Transform to rel. abundance
+  psmelt() %>%                               # Melt to long format
+  filter(Abundance > 0.01) %>%               # Filter out low abundance taxa
+  arrange(Genus)                 # Sort data frame alphabetically by genus
+
+levels(as.factor(Genus$Sample)) #Check default order of sample name
+Family$Sample <- reorder(Family$Sample,Family$WD) #Reorder sample based on water depth
+Genus$Sample <- reorder(Genus$Sample,Genus$WD)
+
+phylum_colors_1 <- c("#0e02f9","#dc01f9","#5E738F","#f73702","#D1A33D","#8A7C64", "#599861","#CBD588","#CD9BCD","#AD6F3B","#dadd06","#71757a","#673770","#D14285","yellow", "#652926","#C84248","#8569D5","#85b3fc","#a3c197","#505e46","#694b77","#fc9c02","#fcb4a9","#f698f9","#8e3966","#700f1f","#4c4c4b","#21301b")
+
+ggplot(filter(Level,Abundance>0.02), aes(x=Sample,y= Abundance,  fill = Genus)) + 
+  #facet_grid(Pressure_regime~.)+
+  #coord_flip()+
+  geom_bar(stat = "identity", width = 0.8)+  #scale_color_brewer(palette = "Dark2")+
+  scale_fill_manual(values = phylum_colors_1) +
+  theme(axis.text.x=element_text(size=11),
+        legend.text = element_text(size=8))
+
+
+Phylum$Sample <- factor(Phylum$Sample, levels = Phylum1$Sample)
+
+
+## Replace all unclassifed genus by Unknown
+Phylum_sub <- subset(Phylum, Class=="Gammaproteobacteria")
+Phylum_sub$Genus <- gsub("unclassified","Unknown", Phylum_sub$Genus) 
+Phylum_sub$Genus <- gsub("uncultured","Unknown", Phylum_sub$Genus)
+Phylum_sub$Genus <- gsub("uncultured_ge","Unknown", Phylum_sub$Genus)
+Phylum_sub$Genus <- gsub("Unknown_ge","Unknown", Phylum_sub$Genus)
+
+
+plot_bar(Genus, fill=Genus)
+tail(Phylum_sub)
+grepl("Unknown",Phylum_mat$Genus)
+Phylum_mat <- Phylum_sub[,c("Sample","Abundance","Genus")]
+
+#Sum similar Genus for each sample
+Phylum_mat_agg <- aggregate(. ~  Sample+Genus, data = Phylum_mat, sum)
+
+ggplot(Phylum_mat_agg, aes(x = Genus, y = Sample, fill = Abundance)) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  geom_tile() 
+  scale_fill_gradient2(low = jBuPuPalette[1],
+                       mid = jBuPuPalette[paletteSize/2],
+                       high = jBuPuPalette[paletteSize],
+                       midpoint = (max(prDatTall$expression) + min(prDatTall$expression)) / 2,
+                       name = "Expression")
+Phylum_matrix <- data.matrix(cast(Phylum_mat_agg, Sample ~ Genus))
+heatmap(Phylum_matrix)
+library(plotly)
+p <- plot_ly(z = Phylum_matrix, type = "heatmap")
+
+
+class(Phylum_matrix)
+heatmap(Phylum_matrix, Rowv=NA, Colv=NA, col = cm.colors(256), scale="column", margins=c(5,10))
+
+```
+
+
+##Unconstrained ordination to show relationships between samples in low dimensions
+```{r Unconstrained ordination}
+min(sample_sums(moth_orig))
+
+# Scale reads to even depth 
+#pick a number slightly smaller than the minimum reads in the group
+sample_scaled <- moth_sample %>%
+  scale_reads(n=1700)
+nosample_scaled <- moth_nosample %>%
+  scale_reads(n=280)
+Pcomp_scaled <- moth_Pcomp %>% 
+  scale_reads(n=1700)
+noorig_scaled <- moth_noorig %>% 
+  scale_reads(n=1700)
+noday0_scaled <- moth_noday0 %>% 
+  scale_reads(n=280)
+noblank_scaled <- moth_noblank %>% 
+  scale_reads(n=280)
+
+# Unconstrained Ordination
+sample_pcoa <- ordinate(physeq = subset_taxa(sample_scaled,Class=='Gammaproteobacteria'),
+                     method = "NMDS",
+                     distance = "bray")
+sample_nmds <- ordinate(physeq = sample_scaled, 
+                     method = "NMDS", 
+                     distance = "bray")
+oil_pcoa_day0 <- ordinate(physeq = oil_scale_day0,
+                     method = "PCoA",
+                     distance = "bray")
+oil_pcoa_other <- ordinate(physeq = oil_scale_other,
+                     method = "PCoA",
+                     distance = "bray")
+
+oil_nmds_noday0 <- ordinate(physeq = oil_scale_noday0, 
+                     method = "DCA", 
+                     distance = "bray")
+noblank_nmds <- ordinate(physeq = noblank_scaled, 
+                     method = "NMDS", 
+                     distance = "bray")
+noblank_pcoa <- ordinate(physeq = noblank_scaled, 
+                     method = "DCA", 
+                     distance = "bray")
+
+# Plot ordination
+#Plot non-multidimensional scaling ordination for all samples
+tiff('NMDS_samples.tiff', units="in",width = 8, height = 6, res=300)
+plot_ordination(physeq = subset_taxa(sample_scaled,Class=='Gammaproteobacteria'),
+                ordination = sample_pcoa,
+                color = "PAH",
+                shape = "Site",
+                title = "NMDS of samples")+
+  scale_shape_manual(values=c(15,1,24,19,25,3,7,8,10))+
+  geom_point(aes(color=PAH), size = 5)+
+  scale_color_gradientn(colours=rev(matlab.like2(10)))+
+  theme_classic()+
+  theme(legend.position = "bottom",
+        legend.background = element_rect(fill = "#EEEEEE", color = "black"),
+        legend.title = element_text(size=16),
+        axis.title = element_text(size = 18),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14))
+dev.off()
+  
+
+
+plot_ordination(physeq = noblank_scaled,
+                ordination = noblank_pcoa,
+                color = "WD",
+                shape = "Type",
+                title = "PCoA of samples")+  
+  #scale_shape_manual(values=c(15,1,24,20,25,3,7,8,10)) +
+  geom_point(aes(color=WD),size = 5)+
+  scale_color_gradientn(colours=rev(matlab.like2(5)))
+  
+
+tiff('NMDS_all.tiff', units="in",width = 9, height = 6, res=300)
+plot_ordination(physeq = noblank_scaled,
+                ordination = noblank_nmds,
+                color = "WD",
+                shape = "Type",
+                title = "NMDS of all samples + day0 + originals + no-oil-controls")+
+  geom_point(size = 4)+
+  scale_color_gradientn(colours=rev(matlab.like2(5)))+
+  theme(legend.background = element_rect(fill = "#EEEEEE", color = "black"),
+        legend.title = element_text(size=14),
+        axis.title = element_text(size = 18),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14))
+  dev.off()
+
+```
+
+##Constrained ordination to see how environmental variables are associated with these changes in community composition
+```{r Constrained ordination}
+bray_sample <- phyloseq::distance(physeq = sample_scaled, method = "bray")
+sampledf <- data.frame(sample_data(moth_sample))
+aov(bray_sample ~ P+T+ALK+PAH+WD, data = sampledf)
+
+
+cap_ord <- ordinate(
+    physeq = sample_scaled, 
+    method = "CAP",
+    distance = bray_sample,
+    formula = ~ T+PAH+P+WD+ALK)
+anova(cap_ord,by = 'mar')
+tiff('CAP_samples.tiff', units="in",width = 9, height = 6, res=300)
+cap_plot <- plot_ordination(
+  physeq = sample_scaled, 
+  ordination = cap_ord, 
+    color = "P", 
+    axes = c(1,2)) + 
+    aes(shape = Site) + 
+    scale_shape_manual(values=c(15,1,24,19,25,3,7,8,10))+
+    geom_point(aes(colour = P), size = 5)+
+  scale_color_gradientn(colours=rev(matlab.like2(5)))
+   
+    
+arrowmat <- vegan::scores(cap_ord, display = "bp")
+arrowdf <- data.frame(labels = rownames(arrowmat), arrowmat)
+arrow_map <- aes(xend = RDA1, 
+    yend = RDA2, 
+    x = 0, 
+    y = 0, 
+    shape = NULL, 
+    color = NULL, 
+    label = labels)
+
+label_map <- aes(x = 1.3*RDA1, 
+    y = 1.3*RDA2, 
+    shape = NULL, 
+    color = NULL, 
+    label = labels)
+
+arrowhead = arrow(length = unit(0.02, "npc"))
+
+cap_plot + 
+  geom_segment(
+    mapping = arrow_map, 
+    size = 1, 
+    data = arrowdf, 
+    color = "gray", 
+    arrow = arrowhead
+  ) + 
+  geom_text(
+    mapping = label_map, 
+    size = 5,  
+    data = arrowdf, 
+    show.legend = FALSE
+  )+
+  theme_classic()+
+  theme(legend.position = "bottom",
+        legend.background = element_rect(fill = "#EEEEEE", color = "black"),
+        legend.title = element_text(size=16),
+        axis.title = element_text(size = 18),
+        axis.text.x = element_text(size=14),
+        axis.text.y = element_text(size=14))
+
+
+dev.off()
+
+```
+
+
+
+
+##Alpha diversity
+```{r plot richness}
+# Plot richness
+tiff('Diversityselected.tiff', units="in",width = 9, height = 6, res=300)
+plot_richness(moth_noblank,
+              measures = c('Shannon','Simpson','InvSimpson'),
+              color='WD',shape='Type')+
+   geom_point(size = 3)+
+  scale_color_gradientn(colours=rev(matlab.like2(5)))+
+  theme_classic()+
+  theme(text=element_text(size=14),
+        legend.title = element_text(size=14),
+        legend.text = element_text(size=12),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.title = element_text(size = 14),
+        axis.text.y = element_text(size=10,colour = 'black'))
+ dev.off()
+ 
+ #Print richness
+richness <- estimate_richness(moth_noblank, measures = c('Shannon','Simpson','InvSimpson'))
+ 
+
+```
+
+
+
+## Hydrocarbon-degrading genes from PICRUST
+
+```{r biom process}
+read_biom(Oil_DNA_greengenes.0.03.biom)
+KEGG <- read.csv("KEGG_output.csv")
+str(KEGG)
+rownames(KEGG) <- KEGG[,1]
+KEGG_t <- t(KEGG) #Transpose KEGG table
+KEGG_t_df <- as.data.frame(KEGG_t)
+map_gene <- read.csv ("Oil_DNA_map.csv")
+map_gene_noblank <- map_gene[-(48:52),]
+dim(KEGG_t_df) <- KEGG_t_df[-c(1,49:55),] #delete first row and blanks
+KEGG_t_df[,329:338] <- map_gene_noblank
+new <- subset(KEGG_t_df, Type=="sample") 
+new_ext <- new[,c(grep("degradation",colnames(new)),329,337,338)]
+write.csv(new_ext, "PAHdegradation.csv")
+plot(new$Naphthalene_degradation,new$Benzoate_degradation)
+
+```
+
+```{r Multiplot function}
+multiplot <- function(..., plotlist=NULL, file, cols=1, layout=NULL) {
+  require(grid)
+
+  # Make a list from the ... arguments and plotlist
+  plots <- c(list(...), plotlist)
+
+  numPlots = length(plots)
+
+  # If layout is NULL, then use 'cols' to determine layout
+  if (is.null(layout)) {
+    # Make the panel
+    # ncol: Number of columns of plots
+    # nrow: Number of rows needed, calculated from # of cols
+    layout <- matrix(seq(1, cols * ceiling(numPlots/cols)),
+                    ncol = cols, nrow = ceiling(numPlots/cols))
+  }
+
+ if (numPlots==1) {
+    print(plots[[1]])
+
+  } else {
+    # Set up the page
+    grid.newpage()
+    pushViewport(viewport(layout = grid.layout(nrow(layout), ncol(layout))))
+
+    # Make each plot, in the correct location
+    for (i in 1:numPlots) {
+      # Get the i,j matrix positions of the regions that contain this subplot
+      matchidx <- as.data.frame(which(layout == i, arr.ind = TRUE))
+
+      print(plots[[i]], vp = viewport(layout.pos.row = matchidx$row,
+                                      layout.pos.col = matchidx$col))
+    }
+  }
+}
+```
+
+
+
+```{r Plot community tree}
+library(graphics)
+library(phytools)
+
+Genus_df <- Genus_1[which(Genus_1$Sample %in% c('1a','1b','14a','14b')),][c("OTU","Sample","Abundance")]
+Genus_pivot <- cast(Genus_df, Sample ~ OTU)
+Genus_pivot[is.na(Genus_pivot)] <- 0
+
+tiff('Tree_allorig.tiff',units="in",width = 5, height = 5, res=300)
+
+comm.bc.dist <- vegdist(Genus_pivot, method = "bray")
+comm.bc.clust <- hclust(comm.bc.dist, method = "average")
+par(ps=10,mar=c(4,3,1,10)) #Readjust margins (bottom,left,right,top)
+tree <- plot(as.dendrogram(comm.bc.clust), xlab = "Bray-Curtis dissimilarity", horiz=T)
+dev.off()
+#,'10a','10b','13a','13b','15a','15b','16a','16b'
+my_tree <- as.phylo(comm.bc.clust ) 
+write.tree(phy=my_tree, file="Tree_lowhighP_1.newick")
+
+phylo.heatmap(tree,moth_noblank)
+tree<- pbtree(n = ntaxa(moth_noblank),tip.label = taxa_names(moth_noblank))
+plot(tree)
+
+
+```
+
+```{r ANOSIMS}
+data(dune)
+data(dune.env)
+#Genus.dist <- vegdist(Genus_pivot)
+#attach(Oil_DNA_map[1:47,])
+#Genus.ano <- anosim(Genus.dist, Type)
+#summary(Genus.ano)
+
+```
+
+
+```{r Plot ordination vegan}
+
+scl <- 6 ## scaling == 3
+rho <- read.csv('RHO_onlygenus.csv')
+meta <- read.csv('RHO_meta.csv')
+ord <- metaMDS(rho)
+colvec <- c("red2", "mediumblue","green")
+plot(ord, scaling = scl)
+with(meta, points(ord, display = "sites", col = colvec[Relative.location],
+                      scaling = scl, pch = 21, bg = colvec[Relative.location]))
+#text(mod, display = "species", scaling = scl, cex = 0.8, col = "darkcyan")
+#with(dune.env, legend("topright", legend = levels(Use), bty = "n",
+                      #col = colvec, pch = 21, pt.bg = colvec))
+
+
+```
+
